@@ -93,6 +93,7 @@ type overlayOptions struct {
 // Driver contains information about the home directory and the list of active
 // mounts that are created using this driver.
 type Driver struct {
+	upperhome     string
 	home          string
 	uidMaps       []idtools.IDMap
 	gidMaps       []idtools.IDMap
@@ -182,7 +183,10 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		return nil, err
 	}
 
+	upperhome := home
+
 	d := &Driver{
+		upperhome:     upperhome,
 		home:          home,
 		uidMaps:       uidMaps,
 		gidMaps:       gidMaps,
@@ -351,6 +355,7 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
 	dir := d.dir(id)
+	upperdir := d.upperdir(id)
 
 	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
 	if err != nil {
@@ -369,10 +374,19 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return err
 	}
 
+	// not sure if dir or upperdir, so both for now
+	if err := idtools.MkdirAllAndChown(path.Dir(upperdir), 0710, dirID); err != nil {
+		return err
+	}
+	if err := idtools.MkdirAndChown(upperdir, 0710, dirID); err != nil {
+		return err
+	}
+
 	defer func() {
 		// Clean up on failure
 		if retErr != nil {
 			os.RemoveAll(dir)
+			os.RemoveAll(upperdir)
 		}
 	}()
 
@@ -387,13 +401,18 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 			if err := d.quotaCtl.SetQuota(dir, driver.options.quota); err != nil {
 				return err
 			}
+			if err := d.quotaCtl.SetQuota(upperdir, driver.options.quota); err != nil {
+				return err
+			}
 		}
 	}
 
-	if err := idtools.MkdirAndChown(path.Join(dir, diffDirName), 0755, root); err != nil {
+	// diff specific
+	if err := idtools.MkdirAndChown(path.Join(upperdir, diffDirName), 0755, root); err != nil {
 		return err
 	}
 
+	// link probably needs to stay in home??
 	lid := overlayutils.GenerateID(idLength, logger)
 	if err := os.Symlink(path.Join("..", id, diffDirName), path.Join(d.home, linkDir, lid)); err != nil {
 		return err
@@ -409,7 +428,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return nil
 	}
 
-	if err := idtools.MkdirAndChown(path.Join(dir, workDirName), 0700, root); err != nil {
+	if err := idtools.MkdirAndChown(path.Join(upperdir, workDirName), 0700, root); err != nil {
 		return err
 	}
 
@@ -480,6 +499,10 @@ func (d *Driver) dir(id string) string {
 	return path.Join(d.home, id)
 }
 
+func (d *Driver) upperdir(id string) string {
+	return path.Join(d.upperhome, id)
+}
+
 func (d *Driver) getLowerDirs(id string) ([]string, error) {
 	var lowersArray []string
 	lowers, err := os.ReadFile(path.Join(d.dir(id), lowerFile))
@@ -529,7 +552,12 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		return nil, err
 	}
 
-	diffDir := path.Join(dir, diffDirName)
+	upperdir := d.upperdir(id)
+	if _, err := os.Stat(upperdir); err != nil {
+		return nil, err
+	}
+
+	diffDir := path.Join(upperdir, diffDirName)
 	lowers, err := os.ReadFile(path.Join(dir, lowerFile))
 	if err != nil {
 		// If no lower, just return diff directory
@@ -557,7 +585,7 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		}
 	}()
 
-	workDir := path.Join(dir, workDirName)
+	workDir := path.Join(upperdir, workDirName)
 	splitLowers := strings.Split(string(lowers), ":")
 	absLowers := make([]string, len(splitLowers))
 	for i, s := range splitLowers {
@@ -714,9 +742,9 @@ func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64
 }
 
 func (d *Driver) getDiffPath(id string) string {
-	dir := d.dir(id)
+	upperdir := d.upperdir(id)
 
-	return path.Join(dir, diffDirName)
+	return path.Join(upperdir, diffDirName)
 }
 
 // DiffSize calculates the changes between the specified id
