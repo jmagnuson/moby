@@ -185,6 +185,12 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 
 	upperhome := home
 
+	upperOverride := os.Getenv("DOCKER_OVERLAY_UPPER_DIR")
+
+	if upperOverride != "" {
+		upperhome = upperOverride
+	}
+
 	d := &Driver{
 		upperhome:     upperhome,
 		home:          home,
