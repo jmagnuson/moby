@@ -598,11 +598,14 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		return nil, err
 	}
 
+	tmpfsDiffDir := path.Join(tmpfsDir, diffDirName)
+	tmpfsWorkDir := path.Join(tmpfsDir, workDirName)
+
 	var opts string
 	if readonly {
 		opts = indexOff + userxattr + "lowerdir=" + diffDir + ":" + strings.Join(absLowers, ":")
 	} else {
-		opts = indexOff + userxattr + "lowerdir=" + strings.Join(absLowers, ":") + ",upperdir=" + diffDir + ",workdir=" + workDir
+		opts = indexOff + userxattr + "lowerdir=" + strings.Join(absLowers, ":") + ",upperdir=" + tmpfsDiffDir + ",workdir=" + tmpfsWorkDir
 	}
 
 	mountData := label.FormatMountLabel(opts, mountLabel)
@@ -629,12 +632,12 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		return nil, err
 	}
 
-	tmpfsDiffDir := path.Join(tmpfsDir, diffDirName)
+	// tmpfsDiffDir := path.Join(tmpfsDir, diffDirName)
 	if err := idtools.MkdirAndChown(tmpfsDiffDir, 0700, root); err != nil {
 		return nil, err
 	}
 
-	tmpfsWorkDir := path.Join(tmpfsDir, workDirName)
+	// tmpfsWorkDir := path.Join(tmpfsDir, workDirName)
 	if err := idtools.MkdirAndChown(tmpfsWorkDir, 0700, root); err != nil {
 		return nil, err
 	}
