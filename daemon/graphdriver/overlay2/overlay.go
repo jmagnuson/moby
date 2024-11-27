@@ -94,6 +94,7 @@ type overlayOptions struct {
 // Driver contains information about the home directory and the list of active
 // mounts that are created using this driver.
 type Driver struct {
+	upperhome     string
 	home          string
 	uidMaps       []idtools.IDMap
 	gidMaps       []idtools.IDMap
@@ -183,7 +184,16 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		return nil, err
 	}
 
+	upperhome := home
+
+	upperOverride := os.Getenv("DOCKER_OVERLAY_UPPER_DIR")
+
+	if upperOverride != "" {
+		upperhome = upperOverride
+	}
+
 	d := &Driver{
+		upperhome:     upperhome,
 		home:          home,
 		uidMaps:       uidMaps,
 		gidMaps:       gidMaps,
@@ -481,6 +491,10 @@ func (d *Driver) dir(id string) string {
 	return path.Join(d.home, id)
 }
 
+func (d *Driver) upperdir(id string) string {
+	return path.Join(d.upperhome, id)
+}
+
 func (d *Driver) getLowerDirs(id string) ([]string, error) {
 	var lowersArray []string
 	lowers, err := os.ReadFile(path.Join(d.dir(id), lowerFile))
@@ -530,6 +544,10 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		return nil, err
 	}
 
+	upperdir := d.upperdir(id)
+	if _, err := os.Stat(upperdir); err != nil {
+		return nil, err
+	}
 	diffDir := path.Join(dir, diffDirName)
 	lowers, err := os.ReadFile(path.Join(dir, lowerFile))
 	if err != nil {
@@ -541,7 +559,7 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 	}
 
 	mergedDir := path.Join(dir, mergedDirName)
-	tmpfsDir := path.Join(dir, tmpfsDirName)
+	tmpfsDir := path.Join(upperdir, tmpfsDirName)
 	if count := d.ctr.Increment(mergedDir); count > 1 {
 		return containerfs.NewLocalContainerFS(mergedDir), nil
 	}
@@ -602,6 +620,60 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 
 	pageSize := unix.Getpagesize()
 
+	//if !strings.HasSuffix(id, "-init") {
+	if err := idtools.MkdirAndChown(tmpfsDir, 0755, root); err != nil {
+		return nil, err
+	}
+
+	if err := unix.Mount("tmpfs", tmpfsDir, "tmpfs", 0, ""); err != nil {
+		return nil, err
+	}
+
+	tmpfsDiffDir := path.Join(tmpfsDir, diffDirName)
+	if err := idtools.MkdirAndChown(tmpfsDiffDir, 0700, root); err != nil {
+		return nil, err
+	}
+
+	tmpfsWorkDir := path.Join(tmpfsDir, workDirName)
+	if err := idtools.MkdirAndChown(tmpfsWorkDir, 0700, root); err != nil {
+		return nil, err
+	}
+
+	s, err := os.Lstat(diffDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.Mode().IsDir() {
+		if err := unix.Rmdir(diffDir); err != nil {
+			logger.Errorf("error removing %v: %v", diffDir, err)
+			return nil, err
+		}
+
+		if err := os.Symlink(tmpfsDiffDir, diffDir); err != nil {
+			logger.Errorf("error symlinking %v->%v: %v", tmpfsDiffDir, diffDir, err)
+			return nil, err
+		}
+	}
+
+	s, err = os.Lstat(workDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.Mode().IsDir() {
+		if err := unix.Rmdir(workDir); err != nil {
+			logger.Errorf("error removing %v: %v", diffDir, err)
+			return nil, err
+		}
+
+		if err := os.Symlink(tmpfsWorkDir, workDir); err != nil {
+			logger.Errorf("error symlinking %v->%v: %v", tmpfsDiffDir, diffDir, err)
+			return nil, err
+		}
+	}
+	//}
+
 	// Use relative paths and mountFrom when the mount data has exceeded
 	// the page size. The mount syscall fails if the mount data cannot
 	// fit within a page and relative links make the mount data much
@@ -610,7 +682,7 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		if readonly {
 			opts = indexOff + userxattr + "lowerdir=" + path.Join(id, diffDirName) + ":" + string(lowers)
 		} else {
-			opts = indexOff + userxattr + "lowerdir=" + string(lowers) + ",upperdir=" + path.Join(id, diffDirName) + ",workdir=" + path.Join(id, workDirName)
+			opts = indexOff + userxattr + "lowerdir=" + string(lowers) + ",upperdir=" + path.Join(id, tmpfsDiffDir) + ",workdir=" + path.Join(id, tmpfsWorkDir)
 		}
 		mountData = label.FormatMountLabel(opts, mountLabel)
 		if len(mountData) > pageSize-1 {
@@ -621,58 +693,6 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 			return mountFrom(d.home, source, target, mType, flags, label)
 		}
 		mountTarget = path.Join(id, mergedDirName)
-	}
-
-
-	if !strings.HasSuffix(id, "-init") {
-		if err := idtools.MkdirAndChown(tmpfsDir, 0755, root); err != nil {
-			return nil, err
-		}
-
-		if err := unix.Mount("tmpfs", tmpfsDir, "tmpfs", 0, ""); err != nil {
-			return nil, err
-		}
-
-		tmpfsDiffDir := path.Join(tmpfsDir, diffDirName)
-		if err := idtools.MkdirAndChown(tmpfsDiffDir, 0700, root); err != nil {
-			return nil, err
-		}
-
-		tmpfsWorkDir := path.Join(tmpfsDir, workDirName)
-		if err := idtools.MkdirAndChown(tmpfsWorkDir, 0700, root); err != nil {
-			return nil, err
-		}
-
-		s, err := os.Lstat(diffDir);
-		if err != nil {
-			return nil, err;
-		}
-
-		if s.Mode().IsDir() {
-			if err := unix.Rmdir(diffDir); err != nil {
-				return nil, err
-			}
-
-			if err := os.Symlink(tmpfsDiffDir, diffDir); err != nil {
-				return nil, err
-			}
-		}
-
-
-		s, err = os.Lstat(workDir);
-		if err != nil {
-			return nil, err;
-		}
-
-		if s.Mode().IsDir() {
-			if err := unix.Rmdir(workDir); err != nil {
-				return nil, err
-			}
-
-			if err := os.Symlink(tmpfsWorkDir, workDir); err != nil {
-				return nil, err
-			}
-		}
 	}
 
 	if err := mount("overlay", mountTarget, "overlay", 0, mountData); err != nil {
